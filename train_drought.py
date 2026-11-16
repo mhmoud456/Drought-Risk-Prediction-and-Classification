@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
-from sklearn.datasets import make_classification
+import requests
+from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier
@@ -13,50 +14,83 @@ from sklearn.metrics import (
     classification_report
 )
 
+def load_climate_data(lat=33.5138, lon=36.2765, start_year=1981, end_year=2025):
+    cache = Path(f"nasa_power_monthly_{lat}_{lon}_{start_year}_{end_year}.csv")
+    if cache.exists():
+        df = pd.read_csv(cache, index_col=0)
+        df.index = pd.to_datetime(df.index)
+        return df
+
+    url = "https://power.larc.nasa.gov/api/temporal/monthly/point"
+    params = {
+        "parameters": "T2M,T2M_MAX,PRECTOTCORR,RH2M",
+        "community": "AG",
+        "longitude": lon,
+        "latitude": lat,
+        "start": start_year,
+        "end": end_year,
+        "format": "JSON"
+    }
+    
+    resp = requests.get(url, params=params, timeout=60)
+    resp.raise_for_status()
+    raw = resp.json()["properties"]["parameter"]
+    
+    df = pd.DataFrame({
+        "temp_mean": raw["T2M"],
+        "temp_max": raw["T2M_MAX"],
+        "precip": raw["PRECTOTCORR"],
+        "humidity": raw["RH2M"]
+    })
+    
+    df = df[df.index.astype(str).str.len() == 6]
+    df.index = pd.to_datetime(df.index, format="%Y%m", errors='coerce')
+    df = df.dropna(how='all')
+    df.index.name = "date"
+    
+    df = df.replace(-999, np.nan)
+    df.to_csv(cache)
+    return df
+
 def generate_drought_dataset():
-    X, y = make_classification(
-        n_samples=5000, 
-        n_features=6, 
-        n_informative=4, 
-        n_redundant=1,
-        n_classes=2, 
-        weights=[0.8, 0.2], 
-        random_state=42
-    )
+    df = load_climate_data()
+    df = df.dropna()
     
-    feature_names = [
-        'Monthly precipitation', 
-        'Average temperature', 
-        'Maximum temperature', 
-        'Rainfall anomaly', 
-        'Previous months\' rainfall',
-        'Soil moisture index'
-    ]
+    precip_mean = df['precip'].mean()
+    precip_std = df['precip'].std()
     
-    df = pd.DataFrame(X, columns=feature_names)
-    df['Drought_Target'] = y
+    df['Drought_Target'] = (df['precip'] < (precip_mean - 0.5 * precip_std)).astype(int)
+    
+    df['Rainfall_anomaly'] = df['precip'] - precip_mean
+    df['Previous_months_rainfall'] = df['precip'].shift(1).fillna(precip_mean)
+    
     return df
 
 def main():
+    print("[INFO] Loading real NASA POWER climate data...")
     df = generate_drought_dataset()
     
-    X = df[[
-        'Monthly precipitation', 
-        'Average temperature', 
-        'Maximum temperature', 
-        'Rainfall anomaly', 
-        'Previous months\' rainfall',
-        'Soil moisture index'
-    ]]
+    features = [
+        'precip', 
+        'temp_mean', 
+        'temp_max', 
+        'humidity', 
+        'Rainfall_anomaly', 
+        'Previous_months_rainfall'
+    ]
+    
+    X = df[features]
     y = df['Drought_Target']
     
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    split_idx = int(len(df) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    
+    print(f"[INFO] Training set shape: {X_train.shape}, Test set shape: {X_test.shape}")
 
     models = {
-        "Decision Tree Classifier": DecisionTreeClassifier(random_state=42, max_depth=6),
-        "XGBoost Classifier": XGBClassifier(random_state=42, eval_metric='logloss', max_depth=5, learning_rate=0.1)
+        "Decision Tree Classifier": DecisionTreeClassifier(random_state=42, max_depth=5),
+        "XGBoost Classifier": XGBClassifier(random_state=42, eval_metric='logloss', max_depth=4, learning_rate=0.1)
     }
 
     for name, model in models.items():
